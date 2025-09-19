@@ -111,9 +111,7 @@ class Qwen3ParityTest(absltest.TestCase):
 
     # --- Full Model tests ---
     def test_qwen_model_parity(self):
-        """
-        Tests the forward/backward parity for full Qwen3Model.
-        """
+        """Tests the forward/backward parity for full Qwen3Model."""
         args = self._get_model_args()
         model_cpu, model_device = self._setup_model(Qwen3Model, args)
         
@@ -164,9 +162,7 @@ class Qwen3ParityTest(absltest.TestCase):
    
    # --- Layer tests ---
     def test_qwen_layers_parity(self):
-        """
-        Tests forward/backward parity for all individual Qwen3 layers.
-        """
+        """Tests forward/backward parity for all individual Qwen3 layers. """
         args = self.args
         
         # Subtest 1: Embedding Layer

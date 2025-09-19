@@ -122,9 +122,7 @@ class Qwen3Test(absltest.TestCase):
 
     # --- Full Model tests ---
     def test_qwen_full_model_forward_cpu_device_parity(self):
-        """
-        Tests forward output parity for full Qwen3Model.
-        """
+        """Tests forward output parity for full Qwen3Model."""
         args = self._get_model_args()
         model_cpu, model_device = self._setup_full_model(args)
         
@@ -140,9 +138,7 @@ class Qwen3Test(absltest.TestCase):
         self.assertTrue(torch.allclose(out_cpu, out_device.cpu(), atol=ATOL_FWD, rtol=RTOL_FWD))
 
     def test_qwen_full_model_backward_cpu_device_parity(self):
-        """
-        Tests backwards gradient parity for the full Qwen3Model.
-        """
+        """Tests backwards gradient parity for the full Qwen3Model."""
         args = self._get_model_args()
         model_cpu, model_device = self._setup_full_model(args)
         
