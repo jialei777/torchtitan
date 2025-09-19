@@ -51,7 +51,7 @@ class Qwen3Test(absltest.TestCase):
         torch.manual_seed(seed)
         logging.info("Using absltest.FLAGS.test_random_seed: %d", seed)
         
-        # Device setup (TODO: add tpu support in g3)
+        # Device setup
         self.device = torch.device(_DEVICE.value)
         reason = None
         

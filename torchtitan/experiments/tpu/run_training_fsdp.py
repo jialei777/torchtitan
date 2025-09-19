@@ -38,8 +38,15 @@ def main():
 
     # 2. Model Configuration
     # Using default TransformerModelArgs for Llama3 7B
-    model_args = TransformerModelArgs(max_seq_len=2048)
-
+    # model_args = TransformerModelArgs(max_seq_len=2048)
+    
+    # Reduced model size to fit on a 40G accelerator.
+    model_args = TransformerModelArgs(
+        dim=2048,
+        n_layers=24,
+        n_heads=16,
+        max_seq_len=2048
+    )
     # 3. Instantiate and Shard the Model
     # Instantiate the model directly on CPU
     model = Transformer(model_args).to("cpu")

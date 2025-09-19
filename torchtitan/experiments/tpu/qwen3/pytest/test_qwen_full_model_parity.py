@@ -11,7 +11,7 @@ from torchtitan.experiments.qwen3.model.model import Qwen3Model, Qwen3ModelArgs
 # The default device is 'cpu', if 'TORCH_DEVICE' is not set.
 # To run tests on a different device, set the 'TORCH_DEVICE' environment variable.
 # For example, to run tests on a CUDA device, use:
-# TORCH_DEVICE='cuda' pytest torchtitan/experiments/tpu/qwen3/test_qwen_full_model_parity.py
+# TORCH_DEVICE='cuda' pytest torchtitan/experiments/tpu/qwen3/pytest/test_qwen_full_model_parity.py
 DEVICE = torch.device(os.environ.get("TORCH_DEVICE", "cpu"))
 # Increased tolerance to account for Q-K normalization
 ATOL_FWD = 1e-4
