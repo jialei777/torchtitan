@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import sys
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -23,8 +22,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._redistribute import redistribute_local_tensor
 from torch.distributed.tensor.placement_types import _StridedShard, Placement
-
-from torchtitan.protocols.module import Module
 
 _active_parametrization = True
 
@@ -45,6 +42,37 @@ class MixedPrecisionPolicy:
     reduce_dtype: torch.dtype | None = None
 
 
+class _ScaledPartial(Partial):
+    # A subclass of Partial placement that allows user to perform reduction with a custom
+    # factor (reduction_divide_factor) other than the default world size.
+    def __init__(
+        self,
+        reduction_divide_factor: float,
+    ):
+        self.reduction_divide_factor = reduction_divide_factor
+        super().__init__(reduce_op="sum")
+
+    def _reduce_value(
+        self, tensor: torch.Tensor, mesh: DeviceMesh, mesh_dim: int
+    ) -> torch.Tensor:
+        # for all_reduce in DDP
+        tensor.div_(self.reduction_divide_factor)
+        reduced = super()._reduce_value(tensor, mesh, mesh_dim)
+        return reduced
+
+    def _reduce_shard_value(
+        self,
+        tensor: torch.Tensor,
+        mesh: DeviceMesh,
+        mesh_dim: int,
+        shard_spec: Placement,
+    ) -> torch.Tensor:
+        # for reduce_scatter in FSDP
+        tensor.div_(self.reduction_divide_factor)
+        reduced = super()._reduce_shard_value(tensor, mesh, mesh_dim, shard_spec)
+        return reduced
+
+
 def _distribute_dtensor(
     tensor: DTensor,
     device_mesh: DeviceMesh,
@@ -55,6 +83,8 @@ def _distribute_dtensor(
     This helps enable Simple FSDP + TP/EP, in which
         inner spec/mesh is TP/EP spec/mesh
         outer spec/mesh is FSDP/DDP/HSDP spec/mesh
+    The logic follows
+    https://github.com/pytorch/pytorch/blob/main/torch/distributed/_composable/fsdp/_fsdp_param.py#L261
     """
     inner_spec = tensor._spec
     outer_mesh, inner_mesh = device_mesh, inner_spec.mesh
@@ -97,18 +127,14 @@ def _distribute_dtensor(
             f"Unsupported placement {dp_placements} for distributing DTensor {tensor}"
         )
 
-    # HSDP case needs 2 placements for 2D outer_mesh
-    current_placements = (Replicate(),) * len(dp_placements)
-    target_placements = tuple(dp_placements)
-
     current_spec = DTensorSpec(
         mesh=outer_mesh,
-        placements=current_placements,
+        placements=(Replicate(),),
         tensor_meta=inner_spec.tensor_meta,
     )
     target_spec = DTensorSpec(
         mesh=outer_mesh,
-        placements=target_placements,
+        placements=(dp_placements[-1],),
         tensor_meta=inner_spec.tensor_meta,
     )
     result_tensor = redistribute_local_tensor(
@@ -127,10 +153,7 @@ def _distribute_dtensor(
     )
 
 
-# Cache of (original_class, param_names) -> wrapper class, so all instances
-# of the same module type share one SimpleFSDP class for torch.compile reuse.
-_wrap_class_cache: dict[tuple[type, frozenset[str]], type] = {}
-
+_patched_classes: dict[type, type] = {}
 
 def _register_parametrization(
     module: nn.Module, param_names: list[str], parametrization: nn.Module
@@ -142,35 +165,43 @@ def _register_parametrization(
     TODO: In checkpoint saving/loading, avoid parametrization calls when calling
     get_model_state_dict func in torchtitan's torchtitan/components/checkpoint.py.
     """
-    param_name_to_property = {
-        param_name: property(
-            lambda self, pn=param_name: parametrization(self._parameters[pn])
-        )
-        for param_name in param_names
-    }
-    cache_key = (module.__class__, frozenset(param_names))
-    if cache_key in _wrap_class_cache:
-        module_cls = _wrap_class_cache[cache_key]
-    else:
+    orig_cls = module.__class__
+    # Cache the patched class to avoid creating a new type for every module instance.
+    # This is critical for torch.compile to avoid creating unique types per instance,
+    # which would trigger cache misses and excessive recompilations.
+    if orig_cls not in _patched_classes:
+        # Since the class is shared across instances, we cannot capture `parametrization`
+        # in the lambda closure (which would lock all instances to the first parametrization).
+        # Instead, we store it on the instance and read it via `self`.
+        param_name_to_property = {
+            param_name: property(
+                lambda self, pn=param_name: self._simple_fsdp_parametrization_list[0](
+                    self._parameters[pn]
+                )
+            )
+            for param_name in param_names
+        }
         module_cls = type(
-            f"SimpleFSDP{module.__class__.__name__}",
-            (module.__class__,),
+            f"SimpleFSDP{orig_cls.__name__}",
+            (orig_cls,),
             param_name_to_property,
         )
-        # Expose the dynamically created class as a real, importable symbol
-        # so that pickle/GraphPickler can resolve it during serialization.
-        sys.modules[module_cls.__module__].__dict__[module_cls.__name__] = module_cls
-        _wrap_class_cache[cache_key] = module_cls
-    module.__class__ = module_cls
+        _patched_classes[orig_cls] = module_cls
+
+    module.__class__ = _patched_classes[orig_cls]
+    # Wrap in a list to bypass PyTorch's auto-submodule registration, 
+    # and store on instance since the class is shared across instances.
+    module._simple_fsdp_parametrization_list = [parametrization]
 
 
-class ReplicateComputation(Module):
+class ReplicateComputation(torch.nn.Module):
     def __init__(
         self,
         device_mesh: DeviceMesh,
         param_sharding: tuple[Placement, ...],
         mode: str,
         mp_policy: MixedPrecisionPolicy | None,
+        reduction_divide_factor: float | None,
         full_dtensor: bool = False,
     ) -> None:
         super().__init__()
@@ -179,7 +210,11 @@ class ReplicateComputation(Module):
         self.mode = mode
         self.compute_placements: list[Placement] = [Replicate()] * self.device_mesh.ndim
         self.grad_placements: list[Placement] = [
-            Partial(reduce_op="sum")
+            _ScaledPartial(
+                reduction_divide_factor=reduction_divide_factor,
+            )
+            if reduction_divide_factor is not None
+            else Partial(reduce_op="avg")
         ] * self.device_mesh.ndim
         mp_policy = mp_policy or MixedPrecisionPolicy()
         self.param_dtype: torch.dtype | None = mp_policy.param_dtype
@@ -250,7 +285,7 @@ class ReplicateComputation(Module):
         # inspection / debugging / initialization
         # model initialization can be done now through
         # with disable_active_parametrization():
-        #     model.init_states()
+        #     model.init_weights()
         if not _active_parametrization:
             return x
 
@@ -264,11 +299,14 @@ def data_parallel(
     mode: str = "replicate",
     mp_policy: MixedPrecisionPolicy | None = None,
     shard_dim: int = 0,
+    reduction_divide_factor: float | None = None,
     full_dtensor: bool = False,
+    ignored_params: set[nn.Parameter] | None = None,
 ) -> nn.Module:
     param_sharding: tuple[Placement, ...]
     if mode == "replicate":
-        param_sharding = (Replicate(),)
+        # Replicate across all dimensions of the device mesh to support multi-dimensional meshes.
+        param_sharding = (Replicate(),) * device_mesh.ndim
     elif mode == "fully_shard":
         param_sharding = (Shard(shard_dim),)
     elif mode == "hybrid_shard":
@@ -289,6 +327,14 @@ def data_parallel(
         if "SimpleFSDP" in mod.__class__.__name__:
             continue
 
+        # Skip parameters that are explicitly ignored (e.g., shared or frozen weights).
+        if ignored_params is not None:
+            params_dict = {
+                p_name: p for p_name, p in params_dict.items() if p not in ignored_params
+            }
+            if not params_dict:
+                continue
+
         for p_name, p in params_dict.items():
             if p is not None and p.numel() > 0:
                 distribute_tensor_func = (
@@ -297,7 +343,9 @@ def data_parallel(
                 mod.register_parameter(
                     p_name,
                     nn.Parameter(
-                        distribute_tensor_func(p, device_mesh, param_sharding)
+                        distribute_tensor_func(p, device_mesh, param_sharding),
+                        # Preserve the requires_grad flag of the original parameter.
+                        requires_grad=p.requires_grad,
                     ),
                 )
 
@@ -323,6 +371,7 @@ def data_parallel(
                 param_sharding,
                 mode,
                 mp_policy=mp_policy,
+                reduction_divide_factor=reduction_divide_factor,
                 full_dtensor=full_dtensor,
             ),
         )
