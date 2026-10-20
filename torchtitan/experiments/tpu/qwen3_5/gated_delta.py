@@ -1,16 +1,14 @@
-"""TPU-compatible GatedDeltaNet, attention and MoE modules for Qwen3.5.
+"""TPU GatedDeltaNet for Qwen3.5: chunked gated delta rule and causal conv1d.
 
 Upstream ``torchtitan.models.qwen3_5.gdn`` imports the CUDA/Triton-only
 ``attn_gym`` package at top level and runs its non-varlen depthwise causal
-``Conv1d`` across the folded ``[T] = [B * S]`` axis as a single stream. In
-addition, upstream ``Qwen35Attention.forward`` does not pass ``positions`` to
-its ``inner_attention``, so neither SDPA nor Splash / Tokamax attention sees
-packed-document boundaries.
+``Conv1d`` across the folded ``[T] = [B * S]`` axis as a single stream.
 
 This module provides:
 1. ``_install_attn_gym_stub()``: installs a stub ``attn_gym`` module in
    ``sys.modules`` when ``attn_gym`` is unavailable so
-   ``torchtitan.models.qwen3_5`` imports cleanly on CPU and TPU.
+   ``torchtitan.models.qwen3_5`` imports cleanly on CPU and TPU. Import this
+   module before ``torchtitan.models.qwen3_5``.
 2. ``chunked_gated_delta``: pure-PyTorch/XLA chunked gated delta rule matching
    ``attn_gym.linear.chunk_gdn`` / HF ``torch_chunk_gated_delta_rule``.
 3. ``TpuGatedDeltaKernel`` and ``TpuInnerGatedDeltaNet``: drop-in ``Module``
@@ -20,27 +18,14 @@ This module provides:
    expand grouped Q/K heads to match ``n_value_heads``. Each ``[B, S]`` row is
    one recurrence: documents packed into a row share the convolution and the
    delta-rule state (no varlen ``cu_seqlens``).
-4. ``PackedScaledDotProductInnerAttention`` and ``TpuQwen35Attention``: forward
-   ``positions`` to the inner attention and apply same-document causal masking
-   on packed sequences.
-5. ``TpuQwen35TokenDispatcher``: static-shape expert-parallel (EP > 1)
-   all-to-all token dispatch and combine that ``TpuGraphTrainer`` can trace.
-6. ``TpuQwen35Model``: the Qwen3.5 model with the above, accepting
-   ``positions``.
 """
 
 from dataclasses import dataclass, field
 import importlib.util
-import math
 import sys
 import types
 
-import spmd_types as spmd
 import torch
-from torch.autograd.function import once_differentiable
-from torch.distributed._functional_collectives import AsyncCollectiveTensor
-from torch.fx.traceback import annotate_fn
-from torch.nn.attention import sdpa_kernel
 import torch.nn.functional as F
 
 
@@ -76,31 +61,11 @@ def _install_attn_gym_stub() -> None:
 _install_attn_gym_stub()
 
 # pylint: disable=g-import-not-at-top,g-bad-import-order
-import torchtitan.config
-from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
-from torchtitan.distributed.utils import get_spmd_backend
-from torchtitan.experiments.graph_trainer.simple_fsdp import disable_active_parametrization
-from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
-from torchtitan.experiments.tpu.token_dispatcher import (
-    TpuAllToAllTokenDispatcher,
-    scale_route_weights,
-    stable_grouped_reduce,
-)
 from torchtitan.experiments.tpu.unflatten_shim import get_unflatten_seq_len
-from torchtitan.models.common.attention import (
-    AttentionMasksType,
-    ScaledDotProductInnerAttention,
-    segment_ids_from_positions,
-)
-from torchtitan.models.common.token_dispatcher import (
-    AllToAllDispatchMetadata,
-    LocalDispatchMetadata,
-)
 from torchtitan.models.qwen3_5.gdn import (
     GatedDeltaKernel,
     InnerGatedDeltaNet,
 )
-from torchtitan.models.qwen3_5.model import Qwen35Attention, Qwen35Model
 
 # pylint: enable=g-import-not-at-top,g-bad-import-order
 
@@ -109,7 +74,7 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
   return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
 
 
-def _resolve_batch_and_seq_len(num_tokens: int) -> tuple[int, int]:
+def resolve_batch_and_seq_len(num_tokens: int) -> tuple[int, int]:
   """Resolves ``(batch_size, seq_len)`` from ``get_unflatten_seq_len()``."""
   seq_len = get_unflatten_seq_len()
   if seq_len is None or num_tokens <= seq_len:
@@ -398,7 +363,7 @@ class TpuGatedDeltaKernel(GatedDeltaKernel):
       xq_THK = xq_THK.repeat_interleave(repeats, dim=1)
       xk_THK = xk_THK.repeat_interleave(repeats, dim=1)
     num_tokens = xq_THK.shape[0]
-    batch_size, seq_len = _resolve_batch_and_seq_len(num_tokens)
+    batch_size, seq_len = resolve_batch_and_seq_len(num_tokens)
     inputs = (
         xq_THK.reshape(batch_size, seq_len, *xq_THK.shape[1:]),
         xk_THK.reshape(batch_size, seq_len, *xk_THK.shape[1:]),
@@ -446,7 +411,7 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
   ) -> torch.Tensor:
     del cu_seqlens  # Fixed-shape [B, S] unflattening via set_unflatten_seq_len.
     num_tokens = query_TC.shape[0]
-    batch_size, seq_len = _resolve_batch_and_seq_len(num_tokens)
+    batch_size, seq_len = resolve_batch_and_seq_len(num_tokens)
 
     def causal_conv(
         x_TC: torch.Tensor,
@@ -476,548 +441,4 @@ class TpuInnerGatedDeltaNet(InnerGatedDeltaNet):
         g_TH,
         beta_TH,
         cu_seqlens=None,
-    )
-
-
-def packed_causal_mask(
-    seq_len: int,
-    device: torch.device,
-    *,
-    segment_ids_BL: torch.Tensor | None = None,
-) -> torch.Tensor:
-  """Causal mask restricted to each packed document within a row."""
-  q_idx = torch.arange(seq_len, device=device).unsqueeze(1)
-  kv_idx = torch.arange(seq_len, device=device).unsqueeze(0)
-  causal_LL = q_idx >= kv_idx
-  if segment_ids_BL is None:
-    return causal_LL
-  same_doc_BLL = segment_ids_BL.unsqueeze(2) == segment_ids_BL.unsqueeze(1)
-  return (causal_LL.unsqueeze(0) & same_doc_BLL).unsqueeze(1)
-
-
-class PackedScaledDotProductInnerAttention(ScaledDotProductInnerAttention):
-  """Document-masked causal SDPA compatible with Splash / Tokamax patches."""
-
-  @dataclass(kw_only=True, slots=True)
-  class Config(ScaledDotProductInnerAttention.Config):
-    pass
-
-  def forward(
-      self,
-      q_BLHK: torch.Tensor,
-      k_BLHK: torch.Tensor,
-      v_BLHV: torch.Tensor,
-      *,
-      attention_masks: AttentionMasksType | None = None,
-      scale: float | None = None,
-      enable_gqa: bool = False,
-      is_causal: bool = True,
-      positions: torch.Tensor | None = None,
-      segment_ids: torch.Tensor | None = None,
-      **kwargs,
-  ) -> torch.Tensor:
-    if segment_ids is None and positions is not None:
-      pos_1d = positions[:, 0] if positions.ndim == 2 else positions
-      segment_ids = segment_ids_from_positions(pos_1d)
-    if segment_ids is None:
-      return super().forward(
-          q_BLHK,
-          k_BLHK,
-          v_BLHV,
-          attention_masks=attention_masks,
-          scale=scale,
-          enable_gqa=enable_gqa,
-          is_causal=is_causal,
-          **kwargs,
-      )
-    if attention_masks is not None:
-      raise ValueError(
-          "PackedScaledDotProductInnerAttention does not support runtime "
-          "attention_masks."
-      )
-    if not is_causal:
-      raise ValueError("Packed-document SDPA attention is always causal.")
-
-    was_3d = q_BLHK.ndim == 3
-    if was_3d:
-      batch_size, seq_len = _resolve_batch_and_seq_len(q_BLHK.shape[0])
-      q_BLHK = q_BLHK.reshape(batch_size, seq_len, *q_BLHK.shape[1:])
-      k_BLHK = k_BLHK.reshape(batch_size, seq_len, *k_BLHK.shape[1:])
-      v_BLHV = v_BLHV.reshape(batch_size, seq_len, *v_BLHV.shape[1:])
-    else:
-      batch_size, seq_len = q_BLHK.shape[:2]
-
-    q_BHLK, k_BHLK, v_BHLV = (
-        q_BLHK.transpose(1, 2),
-        k_BLHK.transpose(1, 2),
-        v_BLHV.transpose(1, 2),
-    )
-    mask = packed_causal_mask(
-        seq_len,
-        q_BHLK.device,
-        segment_ids_BL=segment_ids.reshape(batch_size, seq_len),
-    )
-    with sdpa_kernel(self.sdpa_backends, set_priority=True):
-      out_BHLV = F.scaled_dot_product_attention(
-          q_BHLK,
-          k_BHLK,
-          v_BHLV,
-          attn_mask=mask,
-          scale=scale,
-          enable_gqa=enable_gqa,
-      )
-    out_BLHV = out_BHLV.transpose(1, 2)
-    if was_3d:
-      return out_BLHV.reshape(-1, *out_BLHV.shape[2:])
-    return out_BLHV
-
-
-class TpuQwen35Attention(Qwen35Attention):
-  """Qwen35Attention that forwards ``positions`` to ``inner_attention``."""
-
-  @dataclass(kw_only=True, slots=True)
-  class Config(Qwen35Attention.Config):
-    pass
-
-  def forward(
-      self,
-      x_TD: torch.Tensor,
-      attention_masks: AttentionMasksType | None,
-      positions: torch.Tensor | None = None,
-  ) -> torch.Tensor:
-    num_tokens = x_TD.shape[0]
-    if positions is None:
-      batch_size, seq_len = _resolve_batch_and_seq_len(num_tokens)
-      if batch_size > 1:
-        positions = torch.arange(
-            seq_len, dtype=torch.long, device=x_TD.device
-        ).repeat(batch_size)
-
-    xq_gate_THC = self.wq(x_TD).view(num_tokens, -1, self.head_dim * 2)
-    xq_THK, gate_THV = xq_gate_THC.chunk(2, dim=-1)
-    xk_THK = self.wk(x_TD).view(num_tokens, -1, self.head_dim)
-    xv_THV = self.wv(x_TD).view(num_tokens, -1, self.head_dim)
-
-    xq_THK = self.q_norm(xq_THK)
-    xk_THK = self.k_norm(xk_THK)
-
-    assert self.rotary_dim <= self.head_dim
-    xq_THR, xq_THP = (
-        xq_THK[..., : self.rotary_dim],
-        xq_THK[..., self.rotary_dim :],
-    )
-    xk_THR, xk_THP = (
-        xk_THK[..., : self.rotary_dim],
-        xk_THK[..., self.rotary_dim :],
-    )
-    xq_THR, xk_THR = self.rope(xq_THR, xk_THR, positions)
-    xq_THK = torch.cat([xq_THR, xq_THP], dim=-1)
-    xk_THK = torch.cat([xk_THR, xk_THP], dim=-1)
-
-    out_THV = self.inner_attention(
-        xq_THK,
-        xk_THK,
-        xv_THV,
-        attention_masks=attention_masks,
-        scale=self.scaling,
-        enable_gqa=self.enable_gqa,
-        positions=positions,
-    ).contiguous()
-
-    out_THV = out_THV * torch.sigmoid(gate_THV)
-    out_TD = out_THV.view(num_tokens, -1)
-    return self.wo(out_TD)
-
-
-class _MaskedRowGatherWithInverse(torch.autograd.Function):
-  """Row gather ``x[fwd_idx] * fwd_mask`` whose backward is a gather too.
-
-  ``bwd_idx`` must invert ``fwd_idx`` on the rows where the masks are set, so
-  the input gradient ``(dy * fwd_mask)[bwd_idx] * bwd_mask`` needs no
-  scatter-add.
-  """
-
-  @staticmethod
-  def forward(
-      ctx,
-      x_MD: torch.Tensor,
-      fwd_idx_K: torch.Tensor,
-      fwd_mask_K1: torch.Tensor,
-      bwd_idx_M: torch.Tensor,
-      bwd_mask_M1: torch.Tensor,
-  ) -> torch.Tensor:
-    ctx.set_materialize_grads(False)
-    ctx.save_for_backward(fwd_mask_K1, bwd_idx_M, bwd_mask_M1)
-    if x_MD.shape[0] == 0 or fwd_idx_K.shape[0] == 0:
-      return x_MD.new_zeros((fwd_idx_K.shape[0], x_MD.shape[1]))
-    gathered = torch.index_select(x_MD, 0, fwd_idx_K)
-    return gathered * fwd_mask_K1.to(gathered.dtype)
-
-  @staticmethod
-  @once_differentiable
-  def backward(ctx, grad_out_KD: torch.Tensor | None):
-    if grad_out_KD is None or not ctx.needs_input_grad[0]:
-      return None, None, None, None, None
-    fwd_mask_K1, bwd_idx_M, bwd_mask_M1 = ctx.saved_tensors
-    if grad_out_KD.shape[0] == 0 or bwd_idx_M.shape[0] == 0:
-      return (
-          grad_out_KD.new_zeros((bwd_idx_M.shape[0], grad_out_KD.shape[1])),
-          None,
-          None,
-          None,
-          None,
-      )
-    masked_grad_KD = grad_out_KD * fwd_mask_K1.to(grad_out_KD.dtype)
-    grad_x_MD = torch.index_select(masked_grad_KD, 0, bwd_idx_M)
-    grad_x_MD = grad_x_MD * bwd_mask_M1.to(grad_x_MD.dtype)
-    return grad_x_MD, None, None, None, None
-
-
-def _wait(tensor: torch.Tensor) -> torch.Tensor:
-  """Waits on a functional collective's result.
-
-  GraphTrainer's graph splitter requires a collective's ``wait_tensor`` in the
-  same executable as the collective.
-
-  Args:
-    tensor: A collective's result, possibly an ``AsyncCollectiveTensor``.
-
-  Returns:
-    The plain tensor.
-  """
-  if isinstance(tensor, AsyncCollectiveTensor):
-    return tensor.wait()
-  return tensor
-
-
-@dataclass(frozen=True, kw_only=True)
-class TpuQwen35DispatchMetadata(LocalDispatchMetadata):
-  """Static-shape EP dispatch metadata for ``TpuQwen35TokenDispatcher``."""
-
-  send_flat_idx: torch.Tensor
-  send_valid_flat: torch.Tensor
-  send_slot_N: torch.Tensor  # pylint: disable=invalid-name
-  send_token_valid_N: torch.Tensor  # pylint: disable=invalid-name
-  perm_idx_R: torch.Tensor  # pylint: disable=invalid-name
-  expert_valid_flat: torch.Tensor
-  inv_perm_idx_R: torch.Tensor  # pylint: disable=invalid-name
-  recv_valid_flat: torch.Tensor
-
-
-class TpuQwen35TokenDispatcher(TpuAllToAllTokenDispatcher):
-  """Token dispatcher with static-shape EP > 1 dispatch and combine.
-
-  Upstream ``AllToAllTokenDispatcher`` copies the per-rank token splits to the
-  host (``.to("cpu").tolist()``) for a variable-size all-to-all, which
-  ``TpuGraphTrainer``'s static-shape ``make_fx`` / ``StaticCompiler`` path
-  cannot trace.
-
-  With ``ep_mesh is None`` (EP = 1) this is ``TpuAllToAllTokenDispatcher``.
-  With EP > 1, each rank packs its ``N = T * K`` expert-sorted routed tokens
-  into a static ``(ep_size, cap, D)`` send buffer, ``cap`` tokens per
-  destination rank, and exchanges token counts and buffers with uniform
-  all-to-alls. The receiver permutes the received tokens into expert-major
-  order in a static ``(ep_size * cap, D)`` buffer whose trailing zero rows
-  are assigned to the last local expert. The permutations are computed with
-  int32 compares and ``argsort`` (no host syncs, no ``searchsorted``), and
-  their backward passes are gathers (``_MaskedRowGatherWithInverse``).
-
-  ``capacity_factor=None`` is dropless (``cap = N``, an ``ep_size``-times larger
-  buffer than the routed tokens). Otherwise ``cap = ceil(capacity_factor * N /
-  ep_size)``: a rank's tokens beyond ``cap`` for one destination rank are
-  dropped (zero expert output), unlike the dropless EP = 1 path.
-  """
-
-  @dataclass(kw_only=True, slots=True)
-  class Config(TpuAllToAllTokenDispatcher.Config):
-    capacity_factor: float | None = None
-
-  def __init__(self, config: Config):
-    super().__init__(config)
-    self.capacity_factor = config.capacity_factor
-
-  @annotate_fn({"EP": "dispatch"})
-  def dispatch(
-      self,
-      x_TD: torch.Tensor,
-      topk_scores_TK: torch.Tensor,
-      topk_expert_ids_TK: torch.Tensor,
-      num_local_tokens_per_expert_E: torch.Tensor,
-  ) -> tuple[
-      torch.Tensor,
-      torch.Tensor,
-      AllToAllDispatchMetadata | LocalDispatchMetadata,
-  ]:
-    if self.ep_mesh is None:
-      return super().dispatch(
-          x_TD,
-          topk_scores_TK,
-          topk_expert_ids_TK,
-          num_local_tokens_per_expert_E,
-      )
-
-    ep_size = self.ep_mesh.size()
-    e = self.num_experts // ep_size
-    (
-        routed_input_ND,
-        token_indices_experts_sorted_N,
-        topk_scores_experts_sorted_N,
-    ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
-
-    if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
-      spmd.mutate_type(
-          num_local_tokens_per_expert_E,
-          src=spmd.P,
-          dst={"dp": spmd.V, "cp": spmd.V, "tp": spmd.V},
-      )
-
-    with maybe_set_sparse_mesh():
-      pg = (
-          "ep"
-          if get_spmd_backend() == "spmd_types"
-          else self.ep_mesh.get_group()
-      )
-      if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
-        num_local_tokens_per_expert_E = spmd.reinterpret_mesh(
-            num_local_tokens_per_expert_E, spmd.current_mesh()
-        )
-        routed_input_ND = spmd.reinterpret_mesh(
-            routed_input_ND, spmd.current_mesh()
-        )
-
-      num_routed = routed_input_ND.shape[0]
-      if self.capacity_factor is None:
-        cap = max(num_routed, 1)
-      else:
-        cap = max(
-            1,
-            min(
-                max(num_routed, 1),
-                math.ceil(self.capacity_factor * num_routed / ep_size),
-            ),
-        )
-      r_static = ep_size * cap
-      device = x_TD.device
-
-      with torch.no_grad():
-        local_counts_EP_e = num_local_tokens_per_expert_E.to(
-            torch.int32
-        ).reshape(ep_size, e)
-        if self.capacity_factor is not None:
-          local_cum_e = local_counts_EP_e.cumsum(dim=1).clamp(max=cap)
-          local_counts_capped_EP_e = torch.cat(
-              [local_cum_e[:, :1], local_cum_e[:, 1:] - local_cum_e[:, :-1]],
-              dim=1,
-          )
-        else:
-          local_counts_capped_EP_e = local_counts_EP_e
-
-        send_counts_EP = local_counts_EP_e.sum(dim=1)
-        send_counts_capped_EP = local_counts_capped_EP_e.sum(dim=1)
-        send_ends_EP = send_counts_EP.cumsum(dim=0)
-        send_starts_EP = send_ends_EP - send_counts_EP
-
-        slot_cap = torch.arange(cap, device=device, dtype=torch.int32)
-        send_valid_EP_cap = slot_cap.unsqueeze(
-            0
-        ) < send_counts_capped_EP.unsqueeze(1)
-        send_src_idx_EP_cap = (
-            send_starts_EP.unsqueeze(1) + slot_cap.unsqueeze(0)
-        ).clamp(min=0, max=max(num_routed - 1, 0))
-        send_flat_idx = send_src_idx_EP_cap.reshape(-1).to(torch.long)
-        send_valid_flat = send_valid_EP_cap.reshape(-1, 1)
-
-        idx_N = torch.arange(num_routed, device=device, dtype=torch.int32)
-        after_rank_N_EP = idx_N.unsqueeze(1) >= send_ends_EP.unsqueeze(0)
-        dst_rank_N = (
-            after_rank_N_EP.to(torch.int32)
-            .sum(dim=1)
-            .clamp(max=max(ep_size - 1, 0))
-        )
-        send_start_N = (
-            after_rank_N_EP.to(torch.int32) * send_counts_EP.unsqueeze(0)
-        ).sum(dim=1)
-        pos_in_rank_N = idx_N - send_start_N
-        send_token_valid_N = (pos_in_rank_N < cap).unsqueeze(1)
-        send_slot_N = (
-            dst_rank_N * cap + pos_in_rank_N.clamp(min=0, max=max(cap - 1, 0))
-        ).to(torch.long)
-
-        recv_counts_EP_e = _wait(
-            self._token_count_exchange(
-                local_counts_capped_EP_e.reshape(-1),
-                pg,
-                ep_size,
-            )
-        )
-        t_mat = recv_counts_EP_e.to(torch.int32).reshape(ep_size, e)
-
-        rank_local_ends_EP_e = t_mat.cumsum(dim=1)
-        recv_valid_EP_cap = slot_cap.unsqueeze(0) < rank_local_ends_EP_e[:, -1:]
-        recv_valid_flat = recv_valid_EP_cap.reshape(-1, 1)
-
-        slot_expert_R = (
-            (slot_cap.view(1, cap, 1) >= rank_local_ends_EP_e.unsqueeze(1))
-            .to(torch.int32)
-            .sum(dim=-1)
-            .reshape(-1)
-        )
-        perm_idx_R = torch.argsort(slot_expert_R, stable=True)
-        inv_perm_idx_R = torch.argsort(perm_idx_R)
-
-        local_expert_counts_e = t_mat.sum(dim=0)
-        total_valid = local_expert_counts_e.sum()
-        q_R = torch.arange(r_static, device=device, dtype=torch.int32)
-        expert_valid_flat = (q_R < total_valid).unsqueeze(1)
-        pad_rows = r_static - total_valid
-        num_global_tokens_per_local_expert_e = torch.cat([
-            local_expert_counts_e[:-1],
-            local_expert_counts_e[-1:] + pad_rows,
-        ])
-
-      send_buf_flat = _MaskedRowGatherWithInverse.apply(
-          routed_input_ND,
-          send_flat_idx,
-          send_valid_flat,
-          send_slot_N,
-          send_token_valid_N,
-      )
-      # Uniform splits: every rank sends `cap` rows to every rank.
-      recv_buf_flat = _wait(
-          self._dispatch_token_exchange(send_buf_flat, pg, None, None)
-      )
-      routed_input_RD = _MaskedRowGatherWithInverse.apply(
-          recv_buf_flat,
-          perm_idx_R,
-          expert_valid_flat,
-          inv_perm_idx_R,
-          recv_valid_flat,
-      )
-
-    metadata = TpuQwen35DispatchMetadata(
-        token_indices_experts_sorted_N=token_indices_experts_sorted_N,
-        topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,
-        send_flat_idx=send_flat_idx,
-        send_valid_flat=send_valid_flat,
-        send_slot_N=send_slot_N,
-        send_token_valid_N=send_token_valid_N,
-        perm_idx_R=perm_idx_R,
-        expert_valid_flat=expert_valid_flat,
-        inv_perm_idx_R=inv_perm_idx_R,
-        recv_valid_flat=recv_valid_flat,
-    )
-    return routed_input_RD, num_global_tokens_per_local_expert_e, metadata
-
-  @annotate_fn({"EP": "combine"})
-  def combine(
-      self,
-      routed_output_RD: torch.Tensor,
-      metadata: AllToAllDispatchMetadata | LocalDispatchMetadata,
-      x_TD: torch.Tensor,
-  ) -> torch.Tensor:
-    if self.ep_mesh is None:
-      return super().combine(routed_output_RD, metadata, x_TD)
-    assert isinstance(metadata, TpuQwen35DispatchMetadata)
-
-    with maybe_set_sparse_mesh():
-      pg = (
-          "ep"
-          if get_spmd_backend() == "spmd_types"
-          else self.ep_mesh.get_group()
-      )
-      recv_back_flat = _MaskedRowGatherWithInverse.apply(
-          routed_output_RD,
-          metadata.inv_perm_idx_R,
-          metadata.recv_valid_flat,
-          metadata.perm_idx_R,
-          metadata.expert_valid_flat,
-      )
-      send_back_flat = _wait(
-          self._combine_token_exchange(recv_back_flat, pg, None, None)
-      )
-      routed_output_ND = _MaskedRowGatherWithInverse.apply(
-          send_back_flat,
-          metadata.send_slot_N,
-          metadata.send_token_valid_N,
-          metadata.send_flat_idx,
-          metadata.send_valid_flat,
-      )
-
-    if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
-      routed_output_ND = spmd.reinterpret_mesh(
-          routed_output_ND, spmd.current_mesh()
-      )
-
-    if self.fuse_route_score_backward:
-      routed_output_ND = scale_route_weights(
-          routed_output_ND,
-          metadata.topk_scores_experts_sorted_N,
-      )
-    else:
-      routed_output_ND = (
-          routed_output_ND.float()
-          * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
-      ).to(routed_output_ND.dtype)
-    return stable_grouped_reduce(
-        routed_output_ND,
-        metadata.token_indices_experts_sorted_N,
-        self.top_k,
-    )
-
-
-# Per-destination-rank token capacity of `TpuQwen35TokenDispatcher` under EP.
-_EP_CAPACITY_FACTOR = 1.25
-
-
-class TpuQwen35Model(Qwen35Model):
-  """Qwen35Model accepting ``positions`` positionally or by keyword."""
-
-  @dataclass(kw_only=True, slots=True)
-  class Config(Qwen35Model.Config):
-
-    def update_from_config(self, *, config, **kwargs) -> None:
-      # Zero-argument super() does not work in slots dataclasses on Python
-      # 3.12 (the class is re-created); call the parent explicitly.
-      Qwen35Model.Config.update_from_config(self, config=config, **kwargs)
-      if config.parallelism.expert_parallel_degree > 1:
-        # `ExpertParallel` shards the expert weights on dim 0, which the
-        # paired (w1 + w3) Pallas kernel's fused weight layout does not allow.
-        for _, experts, _, _ in self.traverse(TpuGroupedExperts.Config):
-          experts.use_pallas_paired_grouped_mm = False
-        for _, dispatcher, parent, field_name in list(
-            self.traverse(TpuAllToAllTokenDispatcher.Config)
-        ):
-          if type(dispatcher) is TpuAllToAllTokenDispatcher.Config:  # pylint: disable=unidiomatic-typecheck
-            ep_dispatcher = torchtitan.config.derive(
-                dispatcher,
-                TpuQwen35TokenDispatcher.Config,
-                capacity_factor=_EP_CAPACITY_FACTOR,
-            )
-            if isinstance(parent, list):
-              parent[field_name] = ep_dispatcher
-            else:
-              setattr(parent, field_name, ep_dispatcher)
-
-  def init_states(
-      self,
-      *,
-      buffer_device: torch.device | None = None,
-  ) -> None:
-    # Under SimpleFSDP, parameter reads return all-gathered copies;
-    # initialize the sharded parameters themselves.
-    with disable_active_parametrization():
-      super().init_states(buffer_device=buffer_device)
-
-  def forward(  # pyrefly: ignore[bad-override]
-      self,
-      tokens: torch.Tensor,
-      positions: torch.Tensor | None = None,
-      attention_masks: AttentionMasksType | None = None,
-      **kwargs,
-  ) -> torch.Tensor:
-    return super().forward(
-        tokens,
-        attention_masks=attention_masks,  # pyrefly: ignore[bad-argument-type]
-        positions=positions,
-        **kwargs,
     )

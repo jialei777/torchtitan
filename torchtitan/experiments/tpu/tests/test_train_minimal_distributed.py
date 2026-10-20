@@ -160,8 +160,8 @@ class TrainMinimalDistributedTest(
           tensor_parallel_degree=1,
           args=["--parallelism.use_simple_fsdp"],
           skip_devices=[
+              # Parity is checked on TPU; this case was not validated on CPU.
               device_type.AcceleratorDeviceType.CPU,
-              device_type.AcceleratorDeviceType.TPU,
           ],
           loss_atol=5e-3,
           loss_rtol=5e-3,

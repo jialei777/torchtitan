@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.experiments.tpu.qwen3_5 import gated_delta
+from torchtitan.experiments.tpu.qwen3_5 import model as tpu_model
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import parallelize_qwen3_5
 from torchtitan.models.common import Embedding, Linear
 from torchtitan.models.qwen3_5 import (
@@ -77,7 +78,7 @@ def _to_tpu_text_only_config(
     config: Qwen35Model.Config,
     *,
     seq_len: int | None = None,
-) -> gated_delta.TpuQwen35Model.Config:
+) -> tpu_model.TpuQwen35Model.Config:
   """Converts an upstream ``Qwen35Model.Config`` to a TPU text-only config."""
   tpu_config = copy.deepcopy(config)
   tpu_config.vision_encoder = None
@@ -90,7 +91,7 @@ def _to_tpu_text_only_config(
           if seq_len is not None
           else attn.rope
       )
-      layer.attention = gated_delta.TpuQwen35Attention.Config(
+      layer.attention = tpu_model.TpuQwen35Attention.Config(
           n_heads=attn.n_heads,
           n_kv_heads=attn.n_kv_heads,
           head_dim=attn.head_dim,
@@ -102,7 +103,9 @@ def _to_tpu_text_only_config(
           wo=attn.wo,
           q_norm=attn.q_norm,
           k_norm=attn.k_norm,
-          inner_attention=gated_delta.PackedScaledDotProductInnerAttention.Config(),
+          inner_attention=(
+              tpu_model.PackedScaledDotProductInnerAttention.Config()
+          ),
       )
     elif layer.delta_net is not None:
       layer.delta_net.inner_gated_delta_net = (
@@ -128,7 +131,7 @@ def _to_tpu_text_only_config(
       # have none.
       layer.moe.load_balance_coeff = None
 
-  return gated_delta.TpuQwen35Model.Config(**{
+  return tpu_model.TpuQwen35Model.Config(**{
       field.name: getattr(tpu_config, field.name)
       for field in dataclasses.fields(tpu_config)
       if field.init
@@ -275,20 +278,14 @@ def model_registry(
         f"{default_max_context} for flavor={flavor!r}."
     )
   effective_seq_len = seq_len if seq_len is not None else default_max_context
-  config = _to_tpu_text_only_config(
-      qwen3_5_configs[flavor], seq_len=effective_seq_len
-  )
-
   if moe_comm_backend is not None and flavor in upstream_qwen3_5_configs:
     build_fn, _ = upstream_qwen3_5_configs[flavor]
-    config = _to_tpu_text_only_config(
-        build_fn(
-            "sdpa",
-            seq_len=effective_seq_len,
-            moe_comm_backend=moe_comm_backend,
-        ),
-        seq_len=effective_seq_len,
+    base_config = build_fn(
+        "sdpa", seq_len=effective_seq_len, moe_comm_backend=moe_comm_backend
     )
+  else:
+    base_config = qwen3_5_configs[flavor]
+  config = _to_tpu_text_only_config(base_config, seq_len=effective_seq_len)
 
   if converters:
     validate_converter_order(converters)

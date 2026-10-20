@@ -40,7 +40,10 @@ torchrun --nnodes=16 --nproc_per_node=8 \
 
 The image needs a Tokamax build with the Kimi Delta Attention op
 (`tokamax._src.ops.kda`, [openxla/tokamax](https://github.com/openxla/tokamax)
-HEAD): the tokamax wheels up to 0.1.0 do not have it.
+HEAD): the tokamax wheels up to 0.1.0 (and the `tokamax==0.0.14` pinned in
+`requirements.txt`) do not have it, so `tests/test_tokamax_gated_delta.py`
+skips without it. Without Tokamax, set
+`TpuGatedDeltaKernel.Config.backend="xla"` (the `qwen35_moe_35b` recipe).
 
 ## Recipe
 
@@ -86,10 +89,13 @@ Full 40-layer model on GKE TPU7x slices, sequence length 2048, 20 steps
 | `2x2x1` (8) | 32,768 | 3.54 s | 9,255 | 15.2% | 12.76 / 4.12 / 2.70 |
 | `2x2x2` (16) | 32,768 | 3.59 s | 9,133 | 15.0% | 12.79 / 3.98 / 2.70 |
 | `4x4x4` (128) | 32,768 | 4.25 s | 7,707 | 12.7% | 12.78 / 4.12 / 2.69 |
-| `4x4x4` (128) | 65,536 | 6.89 s | 9,506 | **15.6%** | 12.78 / 4.19 / 2.81 |
+| `4x4x4` (128) | 65,536 | 6.89 s | 9,506 | 15.6% | 12.78 / 4.19 / 2.81 |
+| `4x4x4` (128) | 98,304 | 10.08 s | 9,754 | **16.0%** | 12.78 / 4.25 / 2.91 |
 
 At 128 ranks the ZeRO-3 all-gathers and reduce-scatters take longer than at
-8-16 ranks; 64K tokens per rank hides them again.
+8-16 ranks; 64K tokens per rank hides them again, and 96K tokens per rank
+(61.2 GiB of HBM) is the best measured point. 128K tokens per rank runs out
+of HBM in the first backward.
 
 ## Notes
 

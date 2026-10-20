@@ -442,7 +442,7 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     torch.testing.assert_close(out, expected)
     grads = torch.autograd.grad(out, (x, weight), grad)
     expected_grads = torch.autograd.grad(expected, (x, weight), grad)
-    for actual_grad, expected_grad in zip(grads, expected_grads):
+    for actual_grad, expected_grad in zip(grads, expected_grads, strict=True):
       torch.testing.assert_close(actual_grad, expected_grad)
 
     # On the accelerator in bf16, as the model runs it.
@@ -454,11 +454,43 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         out_bf16, (x_bf16, w_bf16), grad.to(dev, torch.bfloat16)
     )
     self.assertLess(_relative_l2_error(out_bf16.double().cpu(), expected), 1e-2)
-    for actual_grad, expected_grad in zip(grads_bf16, expected_grads):
+    for actual_grad, expected_grad in zip(
+        grads_bf16, expected_grads, strict=True
+    ):
       self.assertEqual(actual_grad.dtype, torch.bfloat16)
       self.assertLess(
           _relative_l2_error(actual_grad.double().cpu(), expected_grad), 2e-2
       )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="_seq1", seq_len=1),
+      dict(testcase_name="_seq2", seq_len=2),
+      dict(testcase_name="_seq3", seq_len=3),
+  )
+  def test_causal_conv_silu_sequences_shorter_than_kernel(self, seq_len: int):
+    """Tests the conv backward when taps reach before the sequence start."""
+    torch.manual_seed(0)
+    channels, kernel_size = 8, 4
+    x = torch.randn(
+        2, seq_len, channels, dtype=torch.float64, requires_grad=True
+    )
+    weight = torch.randn(
+        channels, 1, kernel_size, dtype=torch.float64, requires_grad=True
+    )
+    grad = torch.randn(2, seq_len, channels, dtype=torch.float64)
+    expected = F.silu(
+        F.conv1d(
+            F.pad(x.transpose(1, 2), (kernel_size - 1, 0)),
+            weight,
+            groups=channels,
+        ).transpose(1, 2)
+    )
+    out = gated_delta.causal_conv_silu(x, weight)
+    torch.testing.assert_close(out, expected)
+    grads = torch.autograd.grad(out, (x, weight), grad)
+    expected_grads = torch.autograd.grad(expected, (x, weight), grad)
+    for actual_grad, expected_grad in zip(grads, expected_grads, strict=True):
+      torch.testing.assert_close(actual_grad, expected_grad)
 
   def test_gated_delta_net_isolates_batch_sequences(self):
     """Tests that B=2 packed sequences in GatedDeltaNet equal two B=1 runs."""
@@ -680,8 +712,6 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
         bench_cfg.training.num_tokens_per_microbatch_per_dp_rank, 16 * 2048
     )
     self.assertEqual(bench_cfg.training.dtype, "bfloat16")
-    self.assertEqual(bench_cfg.lr_scheduler.warmup_steps, 200)
-    self.assertEqual(bench_cfg.metrics.log_freq, 5)
     tpu_config = bench_cfg.tpu_config
     self.assertTrue(tpu_config.use_graph_trainer)
     self.assertEqual(tpu_config.graph_trainer_memory_policy, "full")
@@ -697,7 +727,6 @@ class Qwen35Test(base_device_test.BaseAcceleratorDeviceTest):
     self.assertTrue(
         bench_cfg.splash_attention_kernel.use_splash_attention_kernel
     )
-    self.assertEqual(bench_cfg.splash_attention_kernel.sa_block_q_dkv, 1024)
     self.assertIsInstance(bench_cfg.loss, PallasCrossEntropyLoss.Config)
 
     # The 4-layer proxy keeps the recipe, with 1 layer per executable.

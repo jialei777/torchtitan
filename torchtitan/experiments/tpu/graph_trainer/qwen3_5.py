@@ -14,7 +14,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 from torchtitan.experiments.graph_trainer.compile import apply_compile
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 from torchtitan.experiments.tpu import qwen3_5 as tpu_qwen3_5
-from torchtitan.experiments.tpu.qwen3_5 import gated_delta
+from torchtitan.experiments.tpu.qwen3_5 import model as tpu_model
 from torchtitan.experiments.tpu.qwen3_5.infra.parallelize import (
     _validate_supported,
     configure_qwen3_5_simple_fsdp_shard_dims,
@@ -24,7 +24,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 
 def parallelize_qwen3_5(
-    model: gated_delta.TpuQwen35Model,
+    model: tpu_model.TpuQwen35Model,
     *,
     parallel_dims: ParallelDims,
     training: TrainingConfig,
