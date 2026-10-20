@@ -7,7 +7,8 @@ packed-document boundaries. This module provides:
    ``positions`` to the inner attention and apply same-document causal masking
    on packed sequences.
 2. ``TpuQwen35Model``: the Qwen3.5 model accepting ``positions``, initializing
-   SimpleFSDP-sharded parameters in place.
+   SimpleFSDP-sharded parameters in place, and switching to
+   ``TpuQwen35TokenDispatcher`` under expert parallelism.
 """
 
 from dataclasses import dataclass
@@ -15,10 +16,14 @@ from dataclasses import dataclass
 import torch
 from torch.nn.attention import sdpa_kernel
 import torch.nn.functional as F
+import torchtitan.config
 from torchtitan.experiments.graph_trainer.simple_fsdp import disable_active_parametrization
+from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 
 # Installs the `attn_gym` stub before `torchtitan.models.qwen3_5` is imported.
 from torchtitan.experiments.tpu.qwen3_5 import gated_delta
+from torchtitan.experiments.tpu.qwen3_5 import token_dispatcher
+from torchtitan.experiments.tpu.token_dispatcher import TpuAllToAllTokenDispatcher
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     ScaledDotProductInnerAttention,
@@ -189,7 +194,29 @@ class TpuQwen35Model(Qwen35Model):
 
   @dataclass(kw_only=True, slots=True)
   class Config(Qwen35Model.Config):
-    pass
+
+    def update_from_config(self, *, config, **kwargs) -> None:
+      # Zero-argument super() does not work in slots dataclasses on Python
+      # 3.12 (the class is re-created); call the parent explicitly.
+      Qwen35Model.Config.update_from_config(self, config=config, **kwargs)
+      if config.parallelism.expert_parallel_degree > 1:
+        # `ExpertParallel` shards the expert weights on dim 0, which the
+        # paired (w1 + w3) Pallas kernel's fused weight layout does not allow.
+        for _, experts, _, _ in self.traverse(TpuGroupedExperts.Config):
+          experts.use_pallas_paired_grouped_mm = False
+        for _, dispatcher, parent, field_name in list(
+            self.traverse(TpuAllToAllTokenDispatcher.Config)
+        ):
+          if type(dispatcher) is TpuAllToAllTokenDispatcher.Config:  # pylint: disable=unidiomatic-typecheck
+            ep_dispatcher = torchtitan.config.derive(
+                dispatcher,
+                token_dispatcher.TpuQwen35TokenDispatcher.Config,
+                capacity_factor=token_dispatcher.EP_CAPACITY_FACTOR,
+            )
+            if isinstance(parent, list):
+              parent[field_name] = ep_dispatcher
+            else:
+              setattr(parent, field_name, ep_dispatcher)
 
   def init_states(
       self,
