@@ -20,7 +20,7 @@ import spmd_types as spmd
 import torch
 import torch.nn.functional as F
 import torch_remat as remat
-from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.experimental import local_map
 from torch.nn.attention import (
     activate_flash_attention_impl,
@@ -912,6 +912,17 @@ class FusedQKVLinear(BaseQKVLinear):
         return _split(qkv)
 
     @staticmethod
+    def _can_split_or_merge_qkv_locally(tensor: DTensor, n_kv: int) -> bool:
+        """True if ``tensor``'s dim-0 sharding divides ``n_kv`` into contiguous head-groups."""
+        dim0_shards = 1
+        for i, p in enumerate(tensor.placements):
+            if isinstance(p, Shard) and p.dim == 0:
+                if type(p) is not Shard:
+                    return False
+                dim0_shards *= tensor.device_mesh.size(i)
+        return n_kv % dim0_shards == 0
+
+    @staticmethod
     def _split_qkv_on_save(module, state_dict, prefix, local_metadata) -> None:
         """Split fused ``wqkv`` into stock ``wq``/``wk``/``wv`` (weight and bias)."""
         hd, hpk, r = module.head_dim, module.heads_per_kv, module.r_dim
@@ -921,14 +932,18 @@ class FusedQKVLinear(BaseQKVLinear):
             if key not in state_dict:
                 continue
             tensor = state_dict.pop(key)
-            # Gather to Replicate so the n_kv-leading reshape is local (dim 0
-            # unsharded) when a Shard(0) split would not divide n_kv_heads
-            # (e.g. dp_shard=8, n_kv_heads=4); stays a DTensor for the copy.
-            if isinstance(tensor, DTensor):
+            n_kv = tensor.shape[0] // (r * hd)
+            # Only gather to Replicate when a Shard(0) split does not evenly
+            # divide n_kv_heads (e.g. dp_shard=8, n_kv_heads=4) or uses a
+            # non-contiguous dim-0 shard placement; otherwise the n_kv-leading
+            # reshape and slice run locally on DTensor and preserve Shard(0)
+            # without any all-gather.
+            if isinstance(
+                tensor, DTensor
+            ) and not FusedQKVLinear._can_split_or_merge_qkv_locally(tensor, n_kv):
                 tensor = tensor.redistribute(
                     tensor.device_mesh, [Replicate()] * tensor.device_mesh.ndim
                 )
-            n_kv = tensor.shape[0] // (r * hd)
             tail = (tensor.shape[1],) if ndim == 4 else ()
             w = tensor.reshape(n_kv, r, hd, *tail)
             state_dict[f"{prefix}wq.{param}"] = (
@@ -951,15 +966,21 @@ class FusedQKVLinear(BaseQKVLinear):
             if not all(k in state_dict for k in keys):
                 continue
             wq, wk, wv = (state_dict.pop(k) for k in keys)
-            # TODO: check if we could avoid this All-gather
-            # Gather to Replicate so the n_kv reshape is local; stays a DTensor so the
-            # fused result can be copied into the sharded wqkv param.
-            if isinstance(wq, DTensor):
+            n_kv = wk.shape[0] // hd
+            # Only gather to Replicate when a Shard(0) split does not evenly
+            # divide n_kv_heads or placements differ; otherwise reshape + cat
+            # run locally on DTensor without any all-gather.
+            if isinstance(wq, DTensor) and not (
+                wq.placements == wk.placements == wv.placements
+                and all(
+                    FusedQKVLinear._can_split_or_merge_qkv_locally(t, n_kv)
+                    for t in (wq, wk, wv)
+                )
+            ):
                 wq, wk, wv = (
                     t.redistribute(t.device_mesh, [Replicate()] * t.device_mesh.ndim)
                     for t in (wq, wk, wv)
                 )
-            n_kv = wk.shape[0] // hd
             tail = (wq.shape[1],) if ndim == 4 else ()
             q = wq.reshape(n_kv, hpk, hd, *tail)
             k = wk.reshape(n_kv, 1, hd, *tail)
