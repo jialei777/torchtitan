@@ -13,9 +13,14 @@ state_dict hooks, so its checkpoints round-trip with the non-fused module.
 All tests run on CPU.
 """
 
+import tempfile
 import unittest
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import distribute_tensor, DTensor, Replicate, Shard
 from torchtitan.models.common.attention import FusedQKVLinear, QKVLinear
 from torchtitan.models.common.config_utils import _fused_qkv_param_init
 from torchtitan.models.common.linear import Linear
@@ -231,6 +236,127 @@ class TestFusedQKVForwardContiguity(unittest.TestCase):
             xk_fixed.shape, contig_strides, xk_fixed.storage_offset()
         )
         self.assertTrue(torch.equal(raw_fixed, xk_fixed))
+
+
+def _run_sharded_state_dict_worker(
+    rank: int, world_size: int, init_file: str, divisible: bool
+) -> None:
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        mesh = init_device_mesh("cpu", (world_size,))
+        torch.manual_seed(42)
+        if divisible:
+            fused_ref = _build_fused(with_bias=True)
+            sd_ref = fused_ref.state_dict()
+
+            fused = _build_fused(with_bias=True)
+            fused.wqkv.weight = torch.nn.Parameter(
+                distribute_tensor(
+                    fused_ref.wqkv.weight.detach().clone(), mesh, [Shard(0)]
+                )
+            )
+            fused.wqkv.bias = torch.nn.Parameter(
+                distribute_tensor(
+                    fused_ref.wqkv.bias.detach().clone(), mesh, [Shard(0)]
+                )
+            )
+
+            sd = fused.state_dict()
+            for key in (
+                "wq.weight",
+                "wk.weight",
+                "wv.weight",
+                "wq.bias",
+                "wk.bias",
+                "wv.bias",
+            ):
+                assert isinstance(sd[key], DTensor)
+                assert sd[key].placements == (Shard(0),), sd[key].placements
+                assert torch.equal(sd[key].full_tensor(), sd_ref[key]), key
+
+            fused2 = _build_fused(with_bias=True)
+            fused2.wqkv.weight = torch.nn.Parameter(
+                distribute_tensor(
+                    torch.zeros_like(fused_ref.wqkv.weight), mesh, [Shard(0)]
+                )
+            )
+            fused2.wqkv.bias = torch.nn.Parameter(
+                distribute_tensor(
+                    torch.zeros_like(fused_ref.wqkv.bias), mesh, [Shard(0)]
+                )
+            )
+            fused2.load_state_dict(sd)
+            assert fused2.wqkv.weight.placements == (Shard(0),)
+            assert torch.equal(
+                fused2.wqkv.weight.full_tensor(), fused_ref.wqkv.weight
+            )
+            assert torch.equal(fused2.wqkv.bias.full_tensor(), fused_ref.wqkv.bias)
+        else:
+            n_heads, n_kv_heads = 2, 1
+            wqkv_out = (n_heads + 2 * n_kv_heads) * _HEAD_DIM
+            fused_ref = FusedQKVLinear.Config(
+                head_dim=_HEAD_DIM,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                wqkv=Linear.Config(
+                    in_features=_DIM, out_features=wqkv_out, bias=False
+                ),
+            ).build()
+            with torch.no_grad():
+                fused_ref.wqkv.weight.copy_(torch.randn(wqkv_out, _DIM))
+            sd_ref = fused_ref.state_dict()
+
+            fused = FusedQKVLinear.Config(
+                head_dim=_HEAD_DIM,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                wqkv=Linear.Config(
+                    in_features=_DIM, out_features=wqkv_out, bias=False
+                ),
+            ).build()
+            fused.wqkv.weight = torch.nn.Parameter(
+                distribute_tensor(
+                    fused_ref.wqkv.weight.detach().clone(), mesh, [Shard(0)]
+                )
+            )
+
+            sd = fused.state_dict()
+            for key in ("wq.weight", "wk.weight", "wv.weight"):
+                assert isinstance(sd[key], DTensor)
+                assert sd[key].placements == (Replicate(),), sd[key].placements
+                assert torch.equal(sd[key].full_tensor(), sd_ref[key]), key
+    finally:
+        dist.destroy_process_group()
+
+
+class TestFusedQKVDTensorCheckpointInterop(unittest.TestCase):
+    def test_sharded_state_dict_preserves_shard0_when_n_kv_divisible(self):
+        """When n_kv_heads % dp_shard == 0, _split_qkv_on_save and _merge_qkv_on_load
+        operate locally on DTensor and preserve Shard(0) without redistributing to Replicate.
+        """
+        world_size = 2
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mp.spawn(
+                _run_sharded_state_dict_worker,
+                args=(world_size, f"{tmpdir}/rendezvous", True),
+                nprocs=world_size,
+                join=True,
+            )
+
+    def test_sharded_state_dict_redistributes_when_n_kv_not_divisible(self):
+        """When n_kv_heads % dp_shard != 0 (e.g. n_kv_heads=1, dp_shard=2),
+        _split_qkv_on_save falls back to Replicate() so the n_kv reshape succeeds.
+        """
+        world_size = 2
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mp.spawn(
+                _run_sharded_state_dict_worker,
+                args=(world_size, f"{tmpdir}/rendezvous", False),
+                nprocs=world_size,
+                join=True,
+            )
 
 
 if __name__ == "__main__":
