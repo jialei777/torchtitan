@@ -145,9 +145,10 @@ def model_registry(
     flavor: str,
     attn_backend: str = "flex",
     moe_comm_backend: str | None = None,
+    fuse_qkv: bool | None = None,
     converters: list = None,
 ) -> ModelSpec:
-  if flavor == "8B" and attn_backend == "sdpa":
+  if flavor == "8B" and attn_backend == "sdpa" and fuse_qkv is None:
     config = _8b_tpu(attn_backend="sdpa")
     # Since we return a custom ModelSpec for 8B, apply converters here.
     if converters is not None:
@@ -169,6 +170,7 @@ def model_registry(
       flavor,
       attn_backend=attn_backend,
       moe_comm_backend=moe_comm_backend,
+      fuse_qkv=fuse_qkv,
       converters=converters,
   )
 
